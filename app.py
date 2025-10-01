@@ -9,25 +9,43 @@ import io
 import textwrap
 from dotenv import load_dotenv
 
-# Load environment variables from the .env file located up one directory and then in src/app
-dotenv_path = os.path.join(os.path.dirname(__file__), '..', 'src', 'app', 'local.env')
-load_dotenv(dotenv_path=dotenv_path)
+# ---------- ENV ----------
+# บน Render ให้ตั้งค่า ENV ใน Dashboard ได้เลย
+# ถ้ามีไฟล์ .env ในเครื่อง (dev) ก็จะถูกโหลดโดยอัตโนมัติ
+load_dotenv()
 
-
+# ---------- APP & CORS ----------
 app = FastAPI(title="Nani Tax Service")
+
+# อนุญาต origin หลายตัวผ่าน ENV: FRONTEND_ORIGINS="http://localhost:3000,https://your-frontend.app"
+_frontends = os.getenv("FRONTEND_ORIGINS", "")
+allow_origins = [o.strip() for o in _frontends.split(",") if o.strip()] or [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    # เพิ่มโดเมน frontend production ของคุณที่นี่
+    # "https://smart-tax-gules.vercel.app",
+    # "https://<your-render-service>.onrender.com",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "https://smart-tax-gules.vercel.app"],  # TODO: restrict in production
+    allow_origins=allow_origins or ["*"],  # dev: ยอมทุกที่ (ปรับให้แคบลงใน prod)
     allow_methods=["*"],
     allow_headers=["*"],
     allow_credentials=True,
 )
 
-# ---- Settings ----
-UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+# ---------- SETTINGS ----------
+ALLOWED_MIME = {"application/pdf", "image/jpeg", "image/png"}
+MAX_BYTES = 15 * 1024 * 1024  # 15 MB
 
-# ---- Optional workflow imports ----
+BASE_DIR = os.path.dirname(__file__)
+UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
+SAVED_DIR  = os.path.join(BASE_DIR, "saved_records")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(SAVED_DIR, exist_ok=True)
+
+# ---------- OPTIONAL WORKFLOW IMPORTS ----------
 try:
     from prepro import FileHandler
     from ocr_flow import OCRService, TransactionExtractor
@@ -41,25 +59,17 @@ except Exception as e:
     print("[WORKFLOW IMPORT ERROR]", repr(e))
     traceback.print_exc()
     WORKFLOW_AVAILABLE = False
-    
-ALLOWED_MIME = {"application/pdf", "image/jpeg", "image/png"}
-MAX_BYTES = 15 * 1024 * 1024  # 15MB
 
-BASE_DIR = os.path.dirname(__file__)
-UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
-SAVED_DIR  = os.path.join(BASE_DIR, "saved_records")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(SAVED_DIR, exist_ok=True)
-
+# ---------- HELPERS ----------
 def validate_file_upload(file: UploadFile, content: bytes):
     mt = file.content_type or ""
     if mt not in ALLOWED_MIME:
         raise HTTPException(status_code=415, detail=f"Unsupported type: {mt}")
     if len(content) > MAX_BYTES:
         raise HTTPException(status_code=413, detail="File too large")
-    
+
 def normalize_page_key(p):
-    """Accepts keys like 1, "1", "1/2", "page-3" and returns int page number."""
+    """Accepts keys like 1, '1', '1/2', 'page-3' and returns int page number."""
     if isinstance(p, int):
         return p
     s = str(p).strip()
@@ -69,16 +79,37 @@ def normalize_page_key(p):
     m = re.search(r"(\d+)", s)
     return int(m.group(1)) if m else 1
 
+# ---------- BASIC ROUTES (แก้ 404) ----------
+@app.get("/")
+def root():
+    return {"ok": True, "service": "nani-tax-service", "workflow_available": WORKFLOW_AVAILABLE}
 
+@app.get("/health")
+def health():
+    return {"status": "healthy"}
+
+@app.get("/ping")
+def ping():
+    return {"ok": True}
+
+@app.get("/status")
+def status():
+    return {
+        "ok": True,
+        "workflow_available": WORKFLOW_AVAILABLE,
+        "env": {
+            "TYPHOON_API_KEY": bool(os.getenv("TYPHOON_OCR_API_KEY"))
+        }
+    }
+
+# ---------- DB SETUP / CRUD ----------
 @app.get("/create/table")
 async def create_table():
     create_table = DatabaseConnection()
     return create_table.create_table()
 
 @app.post("/api/insert_employee")
-async def insert_employee(
-    payload: dict = Body(...)
-):
+async def insert_employee(payload: dict = Body(...)):
     name = payload.get("name")
     email = payload.get("email")
     password_hash = payload.get("password_hash")
@@ -117,9 +148,7 @@ async def insert_document(
     return {"ok": bool(doc_id), "id": doc_id}
 
 @app.get("/api/get_all_document")
-async def get_all_document(
-    employee_id: int = Query(...)
-):
+async def get_all_document(employee_id: int = Query(...)):
     db = DatabaseConnection()
     documents = db.get_all_document(employee_id)
     return {"ok": True, "documents": documents}
@@ -138,35 +167,20 @@ async def delete_document(document_id: int):
     ok = db.delete_document(document_id)
     return {"ok": bool(ok)}
 
-
-@app.get("/ping")
-def ping():
-    return {"ok": True}
-
-
-@app.get("/status")
-def status():
-    return {
-        "ok": True,
-        "workflow_available": WORKFLOW_AVAILABLE,
-        "env": {
-            "TYPHOON_API_KEY": bool(os.getenv("TYPHOON_OCR_API_KEY"))
-        }
-    }
-
-
+# ---------- UTIL ROUTES ----------
 @app.get("/thumb_text")
 def thumb_text(text: str = Query(...)):
     width, height = 600, 400
     img = Image.new("RGB", (width, height), color=(240, 240, 240))
     draw = ImageDraw.Draw(img)
+
     font_path = os.path.join("fonts", "Sarabun-Italic.ttf")
-    font = ImageFont.truetype(font_path, 32)
+    try:
+        font = ImageFont.truetype(font_path, 32)
+    except Exception:
+        font = ImageFont.load_default()
 
-    # wrap ข้อความไม่ให้ยาวเกิน 25 ตัวอักษรต่อบรรทัด
     wrapped = textwrap.fill(text, width=25)
-
-    # คำนวณตำแหน่ง
     bbox = draw.multiline_textbbox((0, 0), wrapped, font=font, spacing=6)
     text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
     draw.multiline_text(((width - text_w) / 2, (height - text_h) / 2),
@@ -177,8 +191,6 @@ def thumb_text(text: str = Query(...)):
     buf.seek(0)
     return StreamingResponse(buf, media_type="image/png")
 
-
-#ดาวน์โหลดไฟล์ต้นฉบับ
 @app.get("/download/{filename}")
 def download_file(filename: str):
     safe = os.path.basename(filename)
@@ -188,24 +200,17 @@ def download_file(filename: str):
     mt, _ = mimetypes.guess_type(path)
     return FileResponse(path, media_type=mt or "application/octet-stream", filename=safe)
 
-# บันทึกสรุปผลสู่ระบบ
+# ---------- SAVE SUMMARY ----------
 @app.post("/api/save")
 def save_record(payload: dict = Body(...)):
     now = datetime.utcnow().isoformat() + "Z"
     rid = str(int(time.time() * 1000))
-    record = {
-        "id": rid,
-        "savedAt": now,
-        **payload,
-    }
+    record = {"id": rid, "savedAt": now, **payload}
     path = os.path.join(SAVED_DIR, f"{rid}.json")
     with open(path, "w", encoding="utf-8") as f:
-        # ตรงนี้ใช้ ensure_ascii=False ได้ เพราะเราคุม json.dump เอง
         json.dump(record, f, ensure_ascii=False, indent=2)
-
     return JSONResponse({"ok": True, "id": rid, "savedAt": now, "record": record})
 
-# ดึงรายการที่บันทึกทั้งหมด (สรุป)
 @app.get("/api/saved")
 def list_saved():
     items = []
@@ -228,7 +233,6 @@ def list_saved():
         })
     return JSONResponse({"ok": True, "items": items}, ensure_ascii=False)
 
-# ดึงรายการที่บันทึกตาม id (เต็มก้อน)
 @app.get("/api/saved/{rid}")
 def get_saved(rid: str):
     path = os.path.join(SAVED_DIR, f"{os.path.basename(rid)}.json")
@@ -238,6 +242,7 @@ def get_saved(rid: str):
         data = json.load(f)
     return JSONResponse({"ok": True, "record": data}, ensure_ascii=False)
 
+# ---------- MAIN PROCESS ----------
 @app.post("/api/process")
 async def process_file(file: UploadFile = File(...)):
     """
@@ -247,20 +252,17 @@ async def process_file(file: UploadFile = File(...)):
     Returns a normalized JSON suitable for the Next.js frontend.
     """
     try:
-        # Validate
         if not file or not file.filename or file.filename.strip() == "":
             raise HTTPException(status_code=400, detail="No file uploaded or empty filename")
 
         safe_name = os.path.basename(file.filename)
         save_path = os.path.join(UPLOAD_DIR, safe_name)
 
-        # Persist to disk if downstream expects a path
         content = await file.read()
         validate_file_upload(file, content)
         with open(save_path, "wb") as f:
             f.write(content)
 
-        # Demo path when optional workflow modules aren't installed
         if not WORKFLOW_AVAILABLE:
             demo = {
                 "file": safe_name,
@@ -282,6 +284,7 @@ async def process_file(file: UploadFile = File(...)):
                         "deduction_status": "ผ่านเงื่อนไขเบื้องต้น",
                     }
                 },
+                "download_path": f"/download/{safe_name}",
             }
             return {"ok": True, "result": demo}
 
@@ -290,9 +293,7 @@ async def process_file(file: UploadFile = File(...)):
         ocr_service = OCRService()
         extractor = TransactionExtractor(ocr_service)
 
-        # Expecting dict like { page: text }
-        ocr_result = extractor.process_document(file_handler)
-
+        ocr_result = extractor.process_document(file_handler)  # dict: { page: text }
         pages = {}
         base = os.path.splitext(safe_name)[0]
 
@@ -300,7 +301,7 @@ async def process_file(file: UploadFile = File(...)):
             page = normalize_page_key(raw_page)
 
             invoice = ex(text)
-            out = invoice.typhoon_extract()  # may return dict or {"json": {...}}
+            out = invoice.typhoon_extract()             # dict or {"json": {...}}
             payload = out.get("json", out)
 
             pred = prediction(payload).run()
@@ -310,14 +311,16 @@ async def process_file(file: UploadFile = File(...)):
 
             pages[str(page)] = checked
 
-        return JSONResponse({"ok": True, "result": {"file": safe_name, "pages": pages, "download_path": f"/download/{safe_name}"}})
+        return JSONResponse({"ok": True, "result": {
+            "file": safe_name, "pages": pages, "download_path": f"/download/{safe_name}"
+        }})
 
     except HTTPException:
         raise
     except Exception as e:
-        # You can also return JSONResponse(..., status_code=500)
         raise HTTPException(status_code=500, detail=str(e))
 
-
-# --- How to run ---
-# uvicorn app:app --reload --port 8000
+# ---------- ENTRY POINT ----------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=1000)
