@@ -22,7 +22,7 @@ _frontends = os.getenv("FRONTEND_ORIGINS", "")
 allow_origins = [o.strip() for o in _frontends.split(",") if o.strip()] or [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
-    "document-verify-frontend-ten.vercel.app"
+    "https://document-verify-frontend-ten.vercel.app"
     # เพิ่มโดเมน frontend production ของคุณที่นี่
     # "https://smart-tax-gules.vercel.app",
     # "https://<your-render-service>.onrender.com",
